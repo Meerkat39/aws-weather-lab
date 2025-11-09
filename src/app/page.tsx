@@ -32,10 +32,12 @@ export default function Home() {
       (async () => {
         try {
           const promises = favs.map((f) =>
-            fetch(`/api/weather?city=${encodeURIComponent(f.cityName)}`).then((r) => {
-              if (!r.ok) throw new Error("fetch_failed");
-              return r.json();
-            })
+            fetch(`/api/weather?city=${encodeURIComponent(f.cityName)}`).then(
+              (r) => {
+                if (!r.ok) throw new Error("fetch_failed");
+                return r.json();
+              }
+            )
           );
 
           const responses = await Promise.allSettled(promises);
