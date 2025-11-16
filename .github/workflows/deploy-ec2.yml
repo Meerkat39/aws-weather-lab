@@ -27,7 +27,13 @@ jobs:
 
       - name: Archive build
         run: |
-          tar -czf release.tgz .next package.json package-lock.json public next.config.js
+          # package-lock.json or next.config.js may not exist in this repo (we use next.config.ts).
+          FILES=".next package.json public next.config.ts"
+          if [ -f package-lock.json ]; then
+            FILES="$FILES package-lock.json"
+          fi
+          echo "Archiving: $FILES"
+          tar -czf release.tgz $FILES
 
       - name: Copy artifact to EC2
         uses: appleboy/scp-action@master
