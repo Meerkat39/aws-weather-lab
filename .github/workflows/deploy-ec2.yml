@@ -1,0 +1,62 @@
+name: CI / Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_COMMIT_SHA: ${{ github.sha }}
+          BUILD_TIME: ${{ github.run_started_at }}
+        run: npm run build
+
+      - name: Archive build
+        run: |
+          tar -czf release.tgz .next package.json package-lock.json public next.config.js
+
+      - name: Copy artifact to EC2
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          source: "release.tgz"
+          target: ${{ secrets.EC2_DEPLOY_DIR }}
+
+      - name: Remote deploy commands
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          script: |
+            set -e
+            cd ${{ secrets.EC2_DEPLOY_DIR }}
+            tar -xzf release.tgz -C release_tmp
+            # install production deps and switch
+            cd release_tmp
+            npm ci --production
+            # move into place (simple atomic-ish swap)
+            mv ../current ../previous || true
+            mv release_tmp ../current
+            cd ../current
+            # restart pm2 process (assumes process named aws-weather)
+            pm2 restart aws-weather --update-env || pm2 start npm --name aws-weather -- start
+            pm2 save
