@@ -1,12 +1,16 @@
-name: CI / Deploy to EC2
+name: CI / Build & Deploy (S3 + SSM)
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_COMMIT_SHA: ${{ github.sha }}
+      BUILD_TIME: ${{ github.run_started_at }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,14 +24,10 @@ jobs:
         run: npm ci
 
       - name: Build
-        env:
-          NEXT_PUBLIC_COMMIT_SHA: ${{ github.sha }}
-          BUILD_TIME: ${{ github.run_started_at }}
         run: npm run build
 
       - name: Archive build
         run: |
-          # package-lock.json or next.config.js may not exist in this repo (we use next.config.ts).
           FILES=".next package.json public next.config.ts"
           if [ -f package-lock.json ]; then
             FILES="$FILES package-lock.json"
@@ -35,34 +35,51 @@ jobs:
           echo "Archiving: $FILES"
           tar -czf release.tgz $FILES
 
-      - name: Copy artifact to EC2
-        uses: appleboy/scp-action@master
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          port: ${{ secrets.EC2_SSH_PORT }}
-          source: "release.tgz"
-          target: ${{ secrets.EC2_DEPLOY_DIR }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Remote deploy commands
-        uses: appleboy/ssh-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          port: ${{ secrets.EC2_SSH_PORT }}
-          script: |
-            set -e
-            cd ${{ secrets.EC2_DEPLOY_DIR }}
-            tar -xzf release.tgz -C release_tmp
-            # install production deps and switch
-            cd release_tmp
-            npm ci --production
-            # move into place (simple atomic-ish swap)
-            mv ../current ../previous || true
-            mv release_tmp ../current
-            cd ../current
-            # restart pm2 process (assumes process named aws-weather)
-            pm2 restart aws-weather --update-env || pm2 start npm --name aws-weather -- start
-            pm2 save
+      - name: Upload artifact to S3
+        env:
+          BUCKET: ${{ secrets.DEPLOY_S3_BUCKET }}
+          ARTIFACT_KEY: "${{ github.sha }}-${{ github.run_number }}.tgz"
+        run: |
+          echo "Uploading release.tgz to s3://$BUCKET/$ARTIFACT_KEY"
+          aws s3 cp release.tgz s3://$BUCKET/$ARTIFACT_KEY --acl private
+
+      - name: Trigger remote deploy via SSM
+        env:
+          BUCKET: ${{ secrets.DEPLOY_S3_BUCKET }}
+          ARTIFACT_KEY: "${{ github.sha }}-${{ github.run_number }}.tgz"
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          echo "Sending SSM command to instance $INSTANCE_ID to run deploy-from-s3.sh"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy aws-weather $ARTIFACT_KEY" \
+            --parameters commands="['/home/ec2-user/deploy-from-s3.sh $BUCKET $ARTIFACT_KEY']" \
+            --query "Command.CommandId" --output text)
+          echo "Sent command id: $CMD_ID"
+          # wait for completion (poll)
+          for i in {1..60}; do
+            STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query "CommandInvocations[0].Status" --output text)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              echo "SSM command succeeded"
+              exit 0
+            fi
+            if [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Failed" ]; then
+              echo "SSM command failed with status: $STATUS"
+              aws ssm list-command-invocations --command-id "$CMD_ID" --details
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "SSM command did not finish in time"
+          aws ssm list-command-invocations --command-id "$CMD_ID" --details
+          exit 1
